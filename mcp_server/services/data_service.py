@@ -150,7 +150,7 @@ class DataService:
         # 尝试从缓存获取
         date_str = target_date.strftime("%Y-%m-%d")
         cache_key = f"news_by_date:{date_str}:{','.join(platforms or [])}:{limit}:{include_url}"
-        cached = self.cache.get(cache_key, ttl=1800)  # 30分钟缓存
+        cached = self.cache.get(cache_key, ttl=900)  # 15分钟缓存
         if cached:
             return cached
 
@@ -353,7 +353,7 @@ class DataService:
         """
         # 尝试从缓存获取
         cache_key = f"trending_topics:{top_n}:{mode}:{extract_mode}"
-        cached = self.cache.get(cache_key, ttl=1800)  # 30分钟缓存
+        cached = self.cache.get(cache_key, ttl=900)  # 15分钟缓存
         if cached:
             return cached
 
@@ -378,20 +378,32 @@ class DataService:
         word_frequency = Counter()
         keyword_to_news = {}
 
+        # 预加载关键词数据（避免在循环内重复调用）
+        if extract_mode == "keywords":
+            from trendradar.core.frequency import _word_matches
+            word_groups = self.parser.parse_frequency_words()
+
         # 遍历要处理的标题
         for platform_id, titles in titles_to_process.items():
             for title in titles.keys():
                 if extract_mode == "keywords":
-                    # 基于预设关键词统计
-                    word_groups = self.parser.parse_frequency_words()
+                    # 基于预设关键词统计（支持正则匹配）
+                    title_lower = title.lower()
+
                     for group in word_groups:
                         all_words = group.get("required", []) + group.get("normal", [])
-                        for word in all_words:
-                            if word and word in title:
-                                word_frequency[word] += 1
-                                if word not in keyword_to_news:
-                                    keyword_to_news[word] = []
-                                keyword_to_news[word].append(title)
+                        # 检查是否匹配词组中的任意一个词
+                        matched = any(_word_matches(word_config, title_lower) for word_config in all_words)
+
+                        if matched:
+                            # 使用组的 display_name（组别名或行别名拼接）
+                            display_key = group.get("display_name") or group.get("group_key", "")
+
+                            word_frequency[display_key] += 1
+                            if display_key not in keyword_to_news:
+                                keyword_to_news[display_key] = []
+                            keyword_to_news[display_key].append(title)
+                            break  # 每个标题只计入第一个匹配的词组
 
                 elif extract_mode == "auto_extract":
                     # 自动提取关键词
@@ -460,12 +472,6 @@ class DataService:
         Raises:
             FileParseError: 配置文件解析错误
         """
-        # 尝试从缓存获取
-        cache_key = f"config:{section}"
-        cached = self.cache.get(cache_key, ttl=3600)  # 1小时缓存
-        if cached:
-            return cached
-
         # 解析配置文件
         config_data = self.parser.parse_yaml_config()
         word_groups = self.parser.parse_frequency_words()
@@ -473,14 +479,15 @@ class DataService:
         # 根据section返回对应配置
         advanced = config_data.get("advanced", {})
         advanced_crawler = advanced.get("crawler", {})
+        platforms_config = config_data.get("platforms", {})
 
         if section == "all" or section == "crawler":
             crawler_config = {
-                "enable_crawler": advanced_crawler.get("enabled", True),
+                "enable_crawler": platforms_config.get("enabled", True),
                 "use_proxy": advanced_crawler.get("use_proxy", False),
                 "request_interval": advanced_crawler.get("request_interval", 1),
                 "retry_times": 3,
-                "platforms": [p["id"] for p in config_data.get("platforms", [])]
+                "platforms": [p["id"] for p in platforms_config.get("sources", [])]
             }
 
         if section == "all" or section == "push":
@@ -490,17 +497,28 @@ class DataService:
                 "enable_notification": notification.get("enabled", True),
                 "enabled_channels": [],
                 "message_batch_size": batch_size.get("default", 4000),
-                "push_window": notification.get("push_window", {})
+                "push_window": {}  # 已迁移至调度系统（schedule + timeline.yaml）
             }
 
-            # 检测已配置的通知渠道
-            channels = notification.get("channels", {})
-            if channels.get("feishu", {}).get("webhook_url"):
-                push_config["enabled_channels"].append("feishu")
-            if channels.get("dingtalk", {}).get("webhook_url"):
-                push_config["enabled_channels"].append("dingtalk")
-            if channels.get("wework", {}).get("webhook_url"):
-                push_config["enabled_channels"].append("wework")
+            # 检测已配置的通知渠道（合并 config.yaml + .env）
+            from trendradar.core.loader import _load_webhook_config
+
+            webhook_config = _load_webhook_config(config_data)
+
+            channel_checks = {
+                "feishu": [webhook_config.get("FEISHU_WEBHOOK_URL")],
+                "dingtalk": [webhook_config.get("DINGTALK_WEBHOOK_URL")],
+                "wework": [webhook_config.get("WEWORK_WEBHOOK_URL")],
+                "telegram": [webhook_config.get("TELEGRAM_BOT_TOKEN"), webhook_config.get("TELEGRAM_CHAT_ID")],
+                "email": [webhook_config.get("EMAIL_FROM"), webhook_config.get("EMAIL_PASSWORD"), webhook_config.get("EMAIL_TO")],
+                "ntfy": [webhook_config.get("NTFY_SERVER_URL"), webhook_config.get("NTFY_TOPIC")],
+                "bark": [webhook_config.get("BARK_URL")],
+                "slack": [webhook_config.get("SLACK_WEBHOOK_URL")],
+                "generic_webhook": [webhook_config.get("GENERIC_WEBHOOK_URL")],
+            }
+            for ch_id, required_values in channel_checks.items():
+                if all(required_values):
+                    push_config["enabled_channels"].append(ch_id)
 
         if section == "all" or section == "keywords":
             keywords_config = {
@@ -534,9 +552,6 @@ class DataService:
             result = weights_config
         else:
             result = {}
-
-        # 缓存结果
-        self.cache.set(cache_key, result)
 
         return result
 
@@ -674,62 +689,82 @@ class DataService:
     def get_latest_rss(
         self,
         feeds: Optional[List[str]] = None,
+        days: int = 1,
         limit: int = 50,
         include_summary: bool = False
     ) -> List[Dict]:
         """
-        获取最新的 RSS 数据
+        获取最新的 RSS 数据（支持多日查询）
 
         Args:
             feeds: RSS 源 ID 列表，None 表示所有源
+            days: 获取最近 N 天的数据，默认 1（仅今天），最大 30 天
             limit: 返回条数限制
             include_summary: 是否包含摘要，默认 False（节省 token）
 
         Returns:
-            RSS 条目列表
+            RSS 条目列表（按 URL 去重）
 
         Raises:
             DataNotFoundError: 数据不存在
         """
-        cache_key = f"latest_rss:{','.join(feeds or [])}:{limit}:{include_summary}"
+        days = min(max(days, 1), 30)  # 限制 1-30 天
+        cache_key = f"latest_rss:{','.join(feeds or [])}:{days}:{limit}:{include_summary}"
         cached = self.cache.get(cache_key, ttl=900)
         if cached:
             return cached
 
-        # 读取今天的 RSS 数据
-        all_items, id_to_name, timestamps = self.parser.read_all_titles_for_date(
-            date=None,
-            platform_ids=feeds,
-            db_type="rss"
-        )
-
-        # 获取最新的抓取时间
-        if timestamps:
-            latest_timestamp = max(timestamps.values())
-            fetch_time = datetime.fromtimestamp(latest_timestamp)
-        else:
-            fetch_time = datetime.now()
-
-        # 转换为列表
         rss_list = []
-        for feed_id, items in all_items.items():
-            feed_name = id_to_name.get(feed_id, feed_id)
+        seen_urls = set()  # 跨日期 URL 去重
+        today = datetime.now()
 
-            for title, info in items.items():
-                rss_item = {
-                    "title": title,
-                    "feed_id": feed_id,
-                    "feed_name": feed_name,
-                    "url": info.get("url", ""),
-                    "published_at": info.get("published_at", ""),
-                    "author": info.get("author", ""),
-                    "fetch_time": fetch_time.strftime("%Y-%m-%d %H:%M:%S")
-                }
+        for i in range(days):
+            target_date = today - timedelta(days=i)
 
-                if include_summary:
-                    rss_item["summary"] = info.get("summary", "")
+            try:
+                all_items, id_to_name, timestamps = self.parser.read_all_titles_for_date(
+                    date=target_date,
+                    platform_ids=feeds,
+                    db_type="rss"
+                )
 
-                rss_list.append(rss_item)
+                # 获取抓取时间
+                if timestamps:
+                    latest_timestamp = max(timestamps.values())
+                    fetch_time = datetime.fromtimestamp(latest_timestamp)
+                else:
+                    fetch_time = target_date
+
+                # 转换为列表
+                for feed_id, items in all_items.items():
+                    feed_name = id_to_name.get(feed_id, feed_id)
+
+                    for title, info in items.items():
+                        # 跨日期 URL 去重
+                        url = info.get("url", "")
+                        if url and url in seen_urls:
+                            continue
+                        if url:
+                            seen_urls.add(url)
+
+                        rss_item = {
+                            "title": title,
+                            "feed_id": feed_id,
+                            "feed_name": feed_name,
+                            "url": url,
+                            "published_at": info.get("published_at", ""),
+                            "author": info.get("author", ""),
+                            "date": target_date.strftime("%Y-%m-%d"),
+                            "fetch_time": fetch_time.strftime("%Y-%m-%d %H:%M:%S") if isinstance(fetch_time, datetime) else target_date.strftime("%Y-%m-%d")
+                        }
+
+                        if include_summary:
+                            rss_item["summary"] = info.get("summary", "")
+
+                        rss_list.append(rss_item)
+
+            except DataNotFoundError:
+                continue
 
         # 按发布时间排序（最新的在前）
         rss_list.sort(key=lambda x: x.get("published_at", ""), reverse=True)
@@ -751,7 +786,7 @@ class DataService:
         include_summary: bool = False
     ) -> List[Dict]:
         """
-        搜索 RSS 数据
+        搜索 RSS 数据（跨日期自动去重）
 
         Args:
             keyword: 搜索关键词
@@ -761,7 +796,7 @@ class DataService:
             include_summary: 是否包含摘要
 
         Returns:
-            匹配的 RSS 条目列表
+            匹配的 RSS 条目列表（按 URL 去重）
         """
         cache_key = f"search_rss:{keyword}:{','.join(feeds or [])}:{days}:{limit}:{include_summary}"
         cached = self.cache.get(cache_key, ttl=900)
@@ -769,6 +804,7 @@ class DataService:
             return cached
 
         results = []
+        seen_urls = set()  # 用于 URL 去重
         today = datetime.now()
 
         for i in range(days):
@@ -785,6 +821,13 @@ class DataService:
                     feed_name = id_to_name.get(feed_id, feed_id)
 
                     for title, info in items.items():
+                        # 跨日期去重：如果 URL 已出现过则跳过
+                        url = info.get("url", "")
+                        if url and url in seen_urls:
+                            continue
+                        if url:
+                            seen_urls.add(url)
+
                         # 关键词匹配（标题或摘要）
                         summary = info.get("summary", "")
                         if keyword.lower() in title.lower() or keyword.lower() in summary.lower():
@@ -792,7 +835,7 @@ class DataService:
                                 "title": title,
                                 "feed_id": feed_id,
                                 "feed_name": feed_name,
-                                "url": info.get("url", ""),
+                                "url": url,
                                 "published_at": info.get("published_at", ""),
                                 "author": info.get("author", ""),
                                 "date": target_date.strftime("%Y-%m-%d")
@@ -825,7 +868,7 @@ class DataService:
             RSS 源状态信息
         """
         cache_key = "rss_feeds_status"
-        cached = self.cache.get(cache_key, ttl=300)
+        cached = self.cache.get(cache_key, ttl=900)
         if cached:
             return cached
 
